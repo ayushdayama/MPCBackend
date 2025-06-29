@@ -51,7 +51,8 @@
         </div>
     </div>
     <script>
-        const apiBase = 'http://127.0.0.1:8000';
+        // Use relative path for API base (works on Railway and local)
+        const apiBase = '';
         // Navigation
         function showView(viewId) {
             document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));

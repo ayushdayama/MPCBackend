@@ -1,28 +1,32 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.firebase_service import fetch_cycle_data, fetch_feedback, store_feedback
-from app.model import predict_next_date
+from app.firebase_service import fetch_cycle_data, store_feedback
 from app.scheduler import start_scheduler
 from app.training_utils import train_with_feedback
 from contextlib import asynccontextmanager
 import logging
-import configparser
 import os
+import json
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s')
 
-# Load feature flag from local properties file
-config = configparser.ConfigParser()
-config_file = os.path.join(os.path.dirname(__file__), "config.properties")
+# Load feature flag from JSON env variable or fallback to True
 scheduler_enabled = True  # Default to True
-
-if os.path.exists(config_file):
-    config.read(config_file)
-    scheduler_flag = config.get("features", "enable_scheduler", fallback="Y")
-    scheduler_enabled = scheduler_flag.upper() == "Y"
-    logging.info(f"Scheduler feature flag loaded: enable_scheduler={scheduler_flag}")
+scheduler_flag_json = os.environ.get("SCHEDULER_FLAGS_JSON")
+if scheduler_flag_json:
+    try:
+        flags = json.loads(scheduler_flag_json)
+        scheduler_enabled = flags.get("enable_scheduler", True)
+        logging.info(
+            f"Scheduler feature flag loaded from env: enable_scheduler={scheduler_enabled}")
+    except Exception as e:
+        logging.warning(
+            f"Failed to parse SCHEDULER_FLAGS_JSON: {e}. Scheduler will run by default.")
 else:
-    logging.warning("config.properties not found. Scheduler will run by default.")
+    logging.warning(
+        "SCHEDULER_FLAGS_JSON not found. Scheduler will run by default.")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -45,6 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/predict")
 def predict():
     logging.info("Received /predict request.")
@@ -58,12 +63,14 @@ def predict():
     logging.info(f"Prediction result: {result}")
     return result
 
+
 @app.post("/feedback")
 def feedback(data: dict):
     logging.info(f"Received feedback: {data}")
     # Store structured feedback in Firestore
     store_feedback(data)
     return {"message": "Feedback received and stored."}
+
 
 @app.post("/train")
 def train():
@@ -73,6 +80,7 @@ def train():
         return {"message": "Model trained successfully with feedback."}
     else:
         return {"message": "Not enough data to train the model."}
+
 
 @app.get("/cycle_data")
 def cycle_data():
