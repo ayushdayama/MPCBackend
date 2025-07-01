@@ -23,49 +23,64 @@ else:
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-def fetch_cycle_data():
-    logging.info("Fetching cycle data from Firestore...")
-    docs = db.collection("menstrual_data").stream()
-    dates = sorted(doc.to_dict()["date"] for doc in docs)
-    logging.info(f"Fetched {len(dates)} cycle dates.")
+
+def fetch_cycle_data(collection_name: str = "menstrual_data"):
+    logging.info(f"Fetching cycle data for user: {collection_name} (document ID) in 'menstrual_data' collection...")
+    doc = db.collection("menstrual_data").document(collection_name).get()
+    if not doc.exists:
+        logging.info(f"No cycle data found for user {collection_name}.")
+        return []
+    data = doc.to_dict() or {}
+    # Only keep fields that are serial numbers (1, 2, 3, ...)
+    serial_dates = [(int(k), v) for k, v in data.items() if k.isdigit()]
+    serial_dates.sort()
+    dates = [v for _, v in serial_dates]
+    logging.info(f"Fetched {len(dates)} cycle dates for user {collection_name}.")
     return dates
 
-def fetch_feedback():
-    logging.info("Fetching prediction feedback from Firestore...")
-    docs = db.collection("prediction_feedback").stream()
+
+def fetch_feedback(collection_name: str = "prediction_feedback"):
+    logging.info(
+        f"Fetching prediction feedback from Firestore collection: {collection_name}...")
+    docs = db.collection(collection_name).stream()
     feedback = [doc.to_dict() for doc in docs]
     logging.info(f"Fetched {len(feedback)} feedback entries.")
     return feedback
 
-def store_feedback(feedback_data):
-    logging.info(f"Storing feedback: {feedback_data}")
-    db.collection("prediction_feedback").add(feedback_data)
+
+def store_feedback(feedback_data, collection_name: str = "prediction_feedback", data_collection: str = "menstrual_data"):
+    logging.info(f"Storing feedback in collection {collection_name}: {feedback_data}")
+    db.collection(collection_name).add(feedback_data)
     logging.info("Feedback stored in Firestore.")
     # --- Correction logic ---
     actual_date = feedback_data.get("actual_date")
-    if not actual_date:
+    username = feedback_data.get("username")
+    if not actual_date or not username:
         return
-    # Convert actual_date to datetime
-    actual_dt = datetime.strptime(actual_date, "%Y-%m-%d")
-    # Search for existing dates within +/- 7 days
-    docs = db.collection("menstrual_data").stream()
-    found = False
-    for doc in docs:
-        doc_data = doc.to_dict()
-        doc_date_str = doc_data.get("date")
-        if not doc_date_str:
-            continue
-        try:
-            doc_dt = datetime.strptime(doc_date_str, "%Y-%m-%d")
-        except Exception:
-            continue
-        if abs((doc_dt - actual_dt).days) <= 7:
-            # Update this document with the new date
-            db.collection("menstrual_data").document(doc.id).update({"date": actual_date})
-            logging.info(f"Updated menstrual_data doc {doc.id} to date {actual_date}")
-            found = True
-            break
-    if not found:
-        # Add as new entry
-        db.collection("menstrual_data").add({"date": actual_date})
-        logging.info(f"Added new menstrual_data entry with date {actual_date}")
+    # Fetch user's menstrual_data document
+    user_doc_ref = db.collection("menstrual_data").document(username)
+    user_doc = user_doc_ref.get()
+    if user_doc.exists:
+        data = user_doc.to_dict() or {}
+        # Check if date already exists (within 7 days)
+        found = False
+        for k, v in data.items():
+            try:
+                existing_dt = datetime.strptime(v, "%Y-%m-%d")
+                actual_dt = datetime.strptime(actual_date, "%Y-%m-%d")
+                if abs((existing_dt - actual_dt).days) <= 7:
+                    user_doc_ref.update({k: actual_date})
+                    logging.info(f"Updated {username}'s cycle date at key {k} to {actual_date}")
+                    found = True
+                    break
+            except Exception:
+                continue
+        if not found:
+            # Add as new serial number
+            next_key = str(len([k for k in data.keys() if k.isdigit()]) + 1)
+            user_doc_ref.update({next_key: actual_date})
+            logging.info(f"Added new cycle date for {username} at key {next_key}: {actual_date}")
+    else:
+        # Create new document for user
+        user_doc_ref.set({"1": actual_date})
+        logging.info(f"Created new menstrual_data document for {username} with date {actual_date}")

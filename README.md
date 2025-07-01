@@ -28,6 +28,8 @@ cycle-predictor/
 ├── data/                      # Data and models (ignored)
 ├── requirements.txt           # Python dependencies
 ├── .gitignore                 # Ignore rules for secrets, data, venv, etc.
+├── .env.example               # Example environment variables
+├── Procfile                   # Railway deployment process file
 └── README.md                  # Project documentation
 ```
 
@@ -48,11 +50,11 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
-### 3. Configure Firestore
+### 3. Configure Firestore (Local Development)
 - Place your `firebase_key.json` in `app/` (never commit this file).
 - Set up your Firestore project as described in Google Cloud docs.
 
-### 4. Run the App
+### 4. Run the App Locally
 ```sh
 cd app
 uvicorn main:app --reload
@@ -102,11 +104,6 @@ uvicorn main:app --reload
 ## Environment Variables
 - `FIREBASE_KEY_JSON`: Paste the full JSON content of your Firebase service account key (not a file path).
 - `SCHEDULER_FLAGS_JSON`: Paste a JSON string, e.g. `{ "enable_scheduler": true }` to control the scheduler feature flag.
-
----
-
-## License
-MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
