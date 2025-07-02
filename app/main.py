@@ -1,3 +1,4 @@
+from fastapi import Body
 from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 import threading
 from fastapi import FastAPI, HTTPException
@@ -86,6 +87,28 @@ class SecurityAnswerRequest(BaseModel):
     securityAnswer: str
     newPassword: str
 
+# AddCycleDateRequest model
+class AddCycleDateRequest(BaseModel):
+    date: str
+
+# Add a new cycle date for a user
+@app.post("/add-cycle-date/{username}")
+def add_cycle_date(username: str, req: AddCycleDateRequest = Body(...)):
+    from firebase_admin import firestore
+    db = firestore.client()
+    date = req.date
+    if not date:
+        raise HTTPException(status_code=400, detail="Date is required")
+    doc_ref = db.collection("menstrual_data").document(username)
+    doc = doc_ref.get()
+    if doc.exists:
+        data = doc.to_dict() or {}
+        numeric_keys = [int(k) for k in data.keys() if k.isdigit()]
+        next_key = str(max(numeric_keys) + 1) if numeric_keys else "1"
+        doc_ref.update({next_key: date})
+    else:
+        doc_ref.set({"1": date})
+    return {"message": "Cycle date added successfully."}
 
 @app.post("/register")
 def register(credentials: RegisterCredentials):
