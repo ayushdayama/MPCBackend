@@ -1,3 +1,4 @@
+from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 import threading
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +8,7 @@ from app.scheduler import start_scheduler
 from app.training_utils import train_with_feedback
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
+from zoneinfo import ZoneInfo
 import logging
 import os
 # Ensure .env is loaded for environment variables
@@ -51,8 +53,6 @@ async def lifespan(app: FastAPI):
 
 
 # Fix for CORS preflight and error responses
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 
 app = FastAPI(lifespan=lifespan)
 
@@ -68,19 +68,69 @@ app.add_middleware(
 # Pydantic models for request validation
 
 
-class UserCredentials(BaseModel):
+# Separate models for login and registration
+class LoginCredentials(BaseModel):
     username: str
     password: str
 
 
+class RegisterCredentials(BaseModel):
+    username: str
+    password: str
+    securityQuestion: str
+    securityAnswer: str
+
+
+class SecurityAnswerRequest(BaseModel):
+    username: str
+    securityAnswer: str
+    newPassword: str
+
+
 @app.post("/register")
-def register(credentials: UserCredentials):
+def register(credentials: RegisterCredentials):
     logging.info(
         f"Received registration request for username: {credentials.username}")
-    result = create_user(credentials.username, credentials.password)
+    # Pass security question and answer to user_service
+    # Pass as extra args using a wrapper function
+    # Instead of using frame hacks, pass security question/answer as global variables for this call
+    # Use a global dict for passing security question/answer for this call
+    import sys
+    main_mod = sys.modules[__name__]
+    setattr(main_mod, '_SECURITY_CONTEXT', {
+        'security_question': credentials.securityQuestion,
+        'security_answer': credentials.securityAnswer,
+    })
+    try:
+        result = create_user(
+            credentials.username,
+            credentials.password,
+        )
+    finally:
+        setattr(main_mod, '_SECURITY_CONTEXT', None)
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["error"])
     return {"message": "User registered successfully"}
+
+
+# Password recovery endpoints
+@app.get("/security-question/{username}")
+def get_security_question_endpoint(username: str):
+    from app.user_service import get_security_question
+    result = get_security_question(username)
+    if not result["success"]:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return {"securityQuestion": result["securityQuestion"]}
+
+
+@app.post("/reset-password")
+def reset_password(req: SecurityAnswerRequest):
+    from app.user_service import verify_security_answer_and_reset
+    result = verify_security_answer_and_reset(
+        req.username, req.securityAnswer, req.newPassword)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return {"message": result["message"]}
 
 
 # Utility function to trigger training in the background
@@ -96,7 +146,7 @@ def trigger_training_bg(username):
 
 
 @app.post("/login")
-def login(credentials: UserCredentials):
+def login(credentials: LoginCredentials):
     logging.info(
         f"Received login request for username: {credentials.username}")
     result = validate_login(credentials.username, credentials.password)
@@ -131,18 +181,36 @@ def predict(username: str):
 @app.post("/feedback/{username}")
 def feedback(username: str, data: dict):
     logging.info(f"Received feedback from user {username}: {data}")
-    collection_name = get_user_collection(username)
-    if not collection_name:
-        raise HTTPException(status_code=404, detail="User not found")
+    # Compose a detailed log document name and structure
+    from datetime import datetime
+    from firebase_admin import firestore
+    db = firestore.client()
+    now = datetime.now(tz=ZoneInfo('Asia/Kolkata')).strftime('%Y-%b-%d-%H-%M-%S')
+    doc_name = f"{username}_{now}"
+    log_data = {
+        "username": username,
+        "timestamp": now,
+        "predicted_date": data.get("predicted_date"),
+        "actual_date": data.get("actual_date"),
+        "comment": data.get("comment", "")
+    }
+    db.collection("prediction_feedback").document(doc_name).set(log_data)
 
-    # Inject username into feedback data for correction logic
-    data["username"] = username
-
-    feedback_collection = f"prediction_feedback_{username}"
-    store_feedback(data, feedback_collection, collection_name)
-
-    # Trigger training in the background after feedback
-    trigger_training_bg(username)
+    # Also add actual_date to menstrual_data collection as next numeric key
+    actual_date = data.get("actual_date")
+    if actual_date:
+        menstrual_doc_ref = db.collection("menstrual_data").document(username)
+        menstrual_doc = menstrual_doc_ref.get()
+        if menstrual_doc.exists:
+            menstrual_data = menstrual_doc.to_dict() or {}
+            # Find next numeric key
+            numeric_keys = [int(k)
+                            for k in menstrual_data.keys() if k.isdigit()]
+            next_key = str(max(numeric_keys) + 1) if numeric_keys else "1"
+        else:
+            next_key = "1"
+        menstrual_doc_ref.update({next_key: actual_date}) if menstrual_doc.exists else menstrual_doc_ref.set(
+            {next_key: actual_date})
 
     return {"message": "Feedback received and stored."}
 
