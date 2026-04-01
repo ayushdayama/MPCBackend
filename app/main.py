@@ -201,22 +201,45 @@ def predict(username: str):
     return result
 
 
-@app.post("/train-model")
-def train_model_endpoint():
-    logging.info("Received /train-model request")
+from fastapi import BackgroundTasks
+
+TRAIN_STATUS = {
+    "state": "idle",
+    "last_run": None,
+    "last_mae": None,
+    "last_error": None,
+}
+
+
+def _train_model_task():
     from app.firebase_service import fetch_all_menstrual_data
     from app.model import train_model
 
-    all_data = fetch_all_menstrual_data()
-    if not all_data:
-        raise HTTPException(status_code=400, detail="No menstrual data available for training")
-
+    TRAIN_STATUS.update({"state": "running", "last_error": None})
     try:
-        model, mae = train_model(all_data)
-        return {"message": "Model trained successfully", "val_mae": mae}
+        data = fetch_all_menstrual_data()
+        if not data:
+            TRAIN_STATUS.update({"state": "failed", "last_error": "No menstrual data available for training"})
+            return
+        _, mae = train_model(data)
+        TRAIN_STATUS.update({"state": "ready", "last_run": datetime.utcnow().isoformat(), "last_mae": float(mae), "last_error": None})
     except Exception as e:
         logging.error(f"Training failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        TRAIN_STATUS.update({"state": "failed", "last_error": str(e)})
+
+
+@app.post("/train-model")
+def train_model_endpoint(background_tasks: BackgroundTasks):
+    if TRAIN_STATUS["state"] == "running":
+        return {"message": "Training already in progress"}
+    background_tasks.add_task(_train_model_task)
+    TRAIN_STATUS["state"] = "queued"
+    return {"message": "Training started in background", "status_endpoint": "/train-status"}
+
+
+@app.get("/train-status")
+def train_status():
+    return TRAIN_STATUS
 
 
 @app.get("/cycle_data/{username}")

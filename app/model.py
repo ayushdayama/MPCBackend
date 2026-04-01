@@ -8,7 +8,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 import joblib
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'cycle_interval_model.joblib')
+MODEL_PATH = os.getenv('CYCLE_MODEL_PATH', os.path.join(os.path.dirname(__file__), 'cycle_interval_model.joblib'))
+# On platforms like Render, prefer /tmp or a mounted persistent volume:
+# export CYCLE_MODEL_PATH=/tmp/cycle_interval_model.joblib
 MIN_CYCLES_TO_TRAIN = 5
 MAX_LAGS = 6
 
