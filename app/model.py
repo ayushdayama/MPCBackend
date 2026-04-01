@@ -2,9 +2,6 @@ import pandas as pd
 from datetime import timedelta
 import numpy as np
 
-def train_model(dates):
-    # No longer needed for rolling average, but kept for compatibility
-    return True
 
 def predict_next_dates(dates, top_n=3):
     dates = pd.to_datetime(dates)

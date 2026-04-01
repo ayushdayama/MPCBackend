@@ -1,15 +1,10 @@
 from fastapi import Body
 from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
-import threading
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from app.firebase_service import fetch_cycle_data, store_feedback
+from app.firebase_service import fetch_cycle_data
 from app.user_service import create_user, validate_login, get_user_collection
-from app.scheduler import start_scheduler
-from app.training_utils import train_with_feedback
-from contextlib import asynccontextmanager
 from pydantic import BaseModel
-from zoneinfo import ZoneInfo
 import logging
 import os
 # Ensure .env is loaded for environment variables
@@ -19,43 +14,14 @@ try:
 except ImportError:
     logging.warning(
         "python-dotenv not installed; .env file will not be loaded automatically.")
-import os
-import json
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
 
-# Load feature flag from JSON env variable or fallback to True
-scheduler_enabled = True  # Default to True
-scheduler_flag_json = os.environ.get("SCHEDULER_FLAGS_JSON")
-if scheduler_flag_json:
-    try:
-        flags = json.loads(scheduler_flag_json)
-        scheduler_enabled = flags.get("enable_scheduler", True)
-        logging.info(
-            f"Scheduler feature flag loaded from env: enable_scheduler={scheduler_enabled}")
-    except Exception as e:
-        logging.warning(
-            f"Failed to parse SCHEDULER_FLAGS_JSON: {e}. Scheduler will run by default.")
-else:
-    logging.warning(
-        "SCHEDULER_FLAGS_JSON not found. Scheduler will run by default.")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logging.info("FastAPI app startup event triggered.")
-    if scheduler_enabled:
-        logging.info("Scheduler is enabled. Starting scheduler...")
-        start_scheduler()
-    else:
-        logging.info("Scheduler is disabled by feature flag.")
-    yield
-
 
 # Fix for CORS preflight and error responses
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 # Allow CORS for all origins (for local testing)
 app.add_middleware(
@@ -159,15 +125,6 @@ def reset_password(req: SecurityAnswerRequest):
 # Utility function to trigger training in the background
 
 
-def trigger_training_bg(username):
-    def train_bg():
-        try:
-            train_with_feedback(username)
-        except Exception as e:
-            logging.error(f"Background training failed for {username}: {e}")
-    threading.Thread(target=train_bg, daemon=True).start()
-
-
 @app.post("/login")
 def login(credentials: LoginCredentials):
     logging.info(
@@ -175,8 +132,6 @@ def login(credentials: LoginCredentials):
     result = validate_login(credentials.username, credentials.password)
     if not result["success"]:
         raise HTTPException(status_code=401, detail=result["error"])
-    # Trigger training in the background after successful login
-    trigger_training_bg(credentials.username)
     return {
         "message": "Login successful",
         "username": credentials.username
@@ -199,58 +154,6 @@ def predict(username: str):
     }
     logging.info(f"Prediction result for user {username}: {result}")
     return result
-
-
-@app.post("/feedback/{username}")
-def feedback(username: str, data: dict):
-    logging.info(f"Received feedback from user {username}: {data}")
-    # Compose a detailed log document name and structure
-    from datetime import datetime
-    from firebase_admin import firestore
-    db = firestore.client()
-    now = datetime.now(tz=ZoneInfo('Asia/Kolkata')).strftime('%Y-%b-%d-%H-%M-%S')
-    doc_name = f"{username}_{now}"
-    log_data = {
-        "username": username,
-        "timestamp": now,
-        "predicted_date": data.get("predicted_date"),
-        "actual_date": data.get("actual_date"),
-        "comment": data.get("comment", "")
-    }
-    db.collection("prediction_feedback").document(doc_name).set(log_data)
-
-    # Also add actual_date to menstrual_data collection as next numeric key
-    actual_date = data.get("actual_date")
-    if actual_date:
-        menstrual_doc_ref = db.collection("menstrual_data").document(username)
-        menstrual_doc = menstrual_doc_ref.get()
-        if menstrual_doc.exists:
-            menstrual_data = menstrual_doc.to_dict() or {}
-            # Find next numeric key
-            numeric_keys = [int(k)
-                            for k in menstrual_data.keys() if k.isdigit()]
-            next_key = str(max(numeric_keys) + 1) if numeric_keys else "1"
-        else:
-            next_key = "1"
-        menstrual_doc_ref.update({next_key: actual_date}) if menstrual_doc.exists else menstrual_doc_ref.set(
-            {next_key: actual_date})
-
-    return {"message": "Feedback received and stored."}
-
-
-@app.post("/train/{username}")
-def train(username: str):
-    logging.info(
-        f"Received /train request for user: {username}. Training model manually.")
-    collection_name = get_user_collection(username)
-    if not collection_name:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    success = train_with_feedback(collection_name)
-    if success:
-        return {"message": "Model trained successfully with feedback."}
-    else:
-        return {"message": "Not enough data to train the model."}
 
 
 @app.get("/cycle_data/{username}")
