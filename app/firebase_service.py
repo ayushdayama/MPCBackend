@@ -37,3 +37,19 @@ def fetch_cycle_data(collection_name: str = "menstrual_data"):
     dates = [v for _, v in serial_dates]
     logging.info(f"Fetched {len(dates)} cycle dates for user {collection_name}.")
     return dates
+
+
+def fetch_all_menstrual_data() -> dict[str, list[str]]:
+    """Fetch all menstrual_data documents as username -> sorted date list."""
+    logging.info("Fetching all menstrual_data entries for model training...")
+    docs = db.collection("menstrual_data").stream()
+    all_data = {}
+    for doc in docs:
+        data = doc.to_dict() or {}
+        serial_dates = [(int(k), v) for k, v in data.items() if k.isdigit()]
+        serial_dates.sort()
+        dates = [v for _, v in serial_dates]
+        if dates:
+            all_data[doc.id] = dates
+    logging.info(f"Fetched menstrual_data for {len(all_data)} users.")
+    return all_data
