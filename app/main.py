@@ -193,9 +193,23 @@ def predict(username: str):
 
         formatted_dates.append(str(d))
 
+    # Format last date
+    last_date = None
+    if dates:
+        try:
+            last_d = dates[-1]
+            if isinstance(last_d, datetime):
+                last_date = last_d.strftime("%d-%b-%Y")
+            elif isinstance(last_d, str):
+                dt = datetime.fromisoformat(last_d) if "T" in last_d else datetime.strptime(last_d, "%Y-%m-%d")
+                last_date = dt.strftime("%d-%b-%Y")
+        except Exception:
+            last_date = dates[-1]
+
     result = {
         "top_dates": formatted_dates,
-        "next_date": formatted_dates[0] if formatted_dates else None
+        "next_date": formatted_dates[0] if formatted_dates else None,
+        "last_date": last_date
     }
     logging.info(f"Prediction result for user {username}: {result}")
     return result
