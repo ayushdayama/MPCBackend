@@ -1,5 +1,6 @@
 import os
 import logging
+from functools import lru_cache
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
@@ -86,10 +87,12 @@ def train_model(user_cycle_data: dict[str, list[str]], model_path: str = MODEL_P
 
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     joblib.dump(model, model_path)
+    load_model.cache_clear()
     logging.info(f'Saved model at {model_path}')
     return model, mae
 
 
+@lru_cache(maxsize=1)
 def load_model(model_path=MODEL_PATH):
     if os.path.exists(model_path):
         return joblib.load(model_path)

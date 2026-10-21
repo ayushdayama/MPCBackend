@@ -20,7 +20,11 @@ def create_user(username: str, password: str) -> Dict:
     try:
         # Check if username already exists
         users_ref = db.collection("cycle-sense-users")
-        if any(doc.to_dict()["username"] == username for doc in users_ref.stream()):
+        username_key = username.casefold()
+        if any(
+            (doc.to_dict() or {}).get("username", "").casefold() == username_key
+            for doc in users_ref.stream()
+        ):
             return {"success": False, "error": "Username already exists"}
 
         # Hash the password
@@ -97,12 +101,19 @@ def validate_login(username: str, password: str) -> Dict:
         users = users_ref.stream()
 
         hashed_password = hash_password(password)
+        username_key = username.casefold()
 
         for user_doc in users:
-            user_data = user_doc.to_dict()
-            if user_data["username"] == username and user_data["password"] == hashed_password:
+            user_data = user_doc.to_dict() or {}
+            stored_username = user_data.get("username") or user_doc.id
+            if (
+                isinstance(stored_username, str)
+                and stored_username.casefold() == username_key
+                and user_data.get("password") == hashed_password
+            ):
                 return {
-                    "success": True
+                    "success": True,
+                    "username": stored_username,
                 }
 
         return {"success": False, "error": "Invalid credentials"}

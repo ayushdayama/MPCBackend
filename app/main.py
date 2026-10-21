@@ -1,7 +1,7 @@
-from fastapi import Body
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException
 from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
-from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from app.firebase_service import fetch_cycle_data
 from app.user_service import create_user, validate_login, get_user_collection
 from pydantic import BaseModel
@@ -15,6 +15,8 @@ try:
 except ImportError:
     logging.warning(
         "python-dotenv not installed; .env file will not be loaded automatically.")
+
+from app.security import APP_SECRET_KEY_CONFIGURED, create_calendar_state, create_session_token, decode_token, get_current_username
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
@@ -81,7 +83,13 @@ def _to_display_date(date_str: str) -> str:
 
 
 @app.post("/add-cycle-date/{username}")
-def add_cycle_date(username: str, req: AddCycleDateRequest = Body(...)):
+def add_cycle_date(
+    username: str,
+    req: AddCycleDateRequest = Body(...),
+    current_username: str = Depends(get_current_username),
+):
+    if username != current_username:
+        raise HTTPException(status_code=403, detail="You can only update your own cycle dates")
     from firebase_admin import firestore
     db = firestore.client()
     try:
@@ -91,14 +99,31 @@ def add_cycle_date(username: str, req: AddCycleDateRequest = Body(...)):
 
     doc_ref = db.collection("menstrual_data").document(username)
     doc = doc_ref.get()
+    data = doc.to_dict() or {} if doc.exists else {}
+    recorded_dates = set()
+    for key, value in data.items():
+        if key.isdigit():
+            try:
+                recorded_dates.add(_to_storage_date(str(value)))
+            except ValueError:
+                continue
+
+    already_recorded = date in recorded_dates
     if doc.exists:
-        data = doc.to_dict() or {}
-        numeric_keys = [int(k) for k in data.keys() if k.isdigit()]
-        next_key = str(max(numeric_keys) + 1) if numeric_keys else "1"
-        doc_ref.update({next_key: date})
+        if not already_recorded:
+            numeric_keys = [int(k) for k in data.keys() if k.isdigit()]
+            next_key = str(max(numeric_keys) + 1) if numeric_keys else "1"
+            doc_ref.update({next_key: date})
     else:
         doc_ref.set({"1": date})
-    return {"message": "Cycle date added successfully."}
+
+    from app.calendar_service import mark_sync_needed
+    calendar_sync = "manual_required" if mark_sync_needed(username) else "not_connected"
+
+    return {
+        "message": "Cycle date already recorded." if already_recorded else "Cycle date added successfully.",
+        "calendar_sync": calendar_sync,
+    }
 
 @app.post("/register")
 def register(credentials: RegisterCredentials):
@@ -123,7 +148,11 @@ def register(credentials: RegisterCredentials):
         setattr(main_mod, '_SECURITY_CONTEXT', None)
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["error"])
-    return {"message": "User registered successfully"}
+    return {
+        "message": "User registered successfully",
+        "username": credentials.username,
+        "access_token": create_session_token(credentials.username),
+    }
 
 
 # Password recovery endpoints
@@ -146,24 +175,137 @@ def reset_password(req: SecurityAnswerRequest):
     return {"message": result["message"]}
 
 
+def _calendar_frontend_url() -> str:
+    return os.getenv("FRONTEND_URL", "http://localhost:5173/MPCFrontend/").rstrip("/")
+
+
+@app.post("/calendar/connect")
+def calendar_connect(current_username: str = Depends(get_current_username)):
+    if not APP_SECRET_KEY_CONFIGURED:
+        raise HTTPException(
+            status_code=503,
+            detail="Set a persistent APP_SECRET_KEY before connecting Google Calendar",
+        )
+    from app.calendar_service import create_authorization_url
+
+    state = create_calendar_state(current_username)
+    try:
+        return {"authorization_url": create_authorization_url(state)}
+    except Exception as exc:
+        logging.exception("Could not start Google Calendar authorization")
+        raise HTTPException(
+            status_code=503,
+            detail="Google Calendar OAuth is not configured on the backend",
+        ) from exc
+
+
+@app.get("/auth/google/callback")
+def google_calendar_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    redirect_url = f"{_calendar_frontend_url()}/?calendar_sync="
+    if error or not code or not state:
+        return RedirectResponse(f"{redirect_url}cancelled")
+
+    from app.calendar_service import GoogleCalendarPermissionDenied, complete_authorization
+
+    try:
+        username = decode_token(state, "calendar_oauth")
+        complete_authorization(username, code, state)
+    except GoogleCalendarPermissionDenied:
+        logging.warning("Google account did not grant the Calendar Events permission")
+        return RedirectResponse(f"{redirect_url}permission")
+    except Exception:
+        logging.exception("Google Calendar authorization failed")
+        return RedirectResponse(f"{redirect_url}error")
+    return RedirectResponse(f"{redirect_url}connected")
+
+
+def _sync_calendar_history(username: str) -> None:
+    from app.calendar_service import sync_all_recorded_dates
+
+    sync_all_recorded_dates(username)
+
+
+def _desync_calendar_entries(username: str) -> None:
+    from app.calendar_service import desync_calendar_entries
+
+    desync_calendar_entries(username)
+
+
+@app.get("/calendar/status")
+def calendar_status(current_username: str = Depends(get_current_username)):
+    from app.calendar_service import get_calendar_status
+
+    return get_calendar_status(current_username)
+
+
+@app.post("/calendar/sync")
+def calendar_sync(
+    background_tasks: BackgroundTasks,
+    current_username: str = Depends(get_current_username),
+):
+    from app.calendar_service import get_calendar_status, mark_sync_queued
+
+    if not get_calendar_status(current_username)["connected"]:
+        raise HTTPException(status_code=409, detail="Connect a Google Calendar first")
+    mark_sync_queued(current_username)
+    background_tasks.add_task(_sync_calendar_history, current_username)
+    return {"status": "queued"}
+
+
+@app.post("/calendar/desync")
+def calendar_desync(
+    background_tasks: BackgroundTasks,
+    current_username: str = Depends(get_current_username),
+):
+    from app.calendar_service import get_calendar_status, mark_sync_queued
+
+    if not get_calendar_status(current_username)["connected"]:
+        raise HTTPException(status_code=409, detail="Connect a Google Calendar first")
+    mark_sync_queued(current_username)
+    background_tasks.add_task(_desync_calendar_entries, current_username)
+    return {"status": "queued"}
+
+
+@app.post("/calendar/disconnect")
+def calendar_disconnect(current_username: str = Depends(get_current_username)):
+    from app.calendar_service import disconnect_calendar
+
+    disconnect_calendar(current_username)
+    return {"message": "Google Calendar disconnected"}
+
+
 # Utility function to trigger training in the background
 
 
+def _warm_prediction_model():
+    from app.model import load_model
+    load_model()
+
+
 @app.post("/login")
-def login(credentials: LoginCredentials):
+def login(credentials: LoginCredentials, background_tasks: BackgroundTasks):
     logging.info(
         f"Received login request for username: {credentials.username}")
     result = validate_login(credentials.username, credentials.password)
     if not result["success"]:
         raise HTTPException(status_code=401, detail=result["error"])
+    username = result.get("username", credentials.username)
+    background_tasks.add_task(_warm_prediction_model)
     return {
         "message": "Login successful",
-        "username": credentials.username
+        "username": username,
+        "access_token": create_session_token(username),
     }
 
 
 @app.get("/predict/{username}")
-def predict(username: str):
+def predict(username: str, current_username: str = Depends(get_current_username)):
+    if username != current_username:
+        raise HTTPException(status_code=403, detail="You can only access your own cycle dates")
     logging.info(f"Received /predict request for user: {username}")
     collection_name = get_user_collection(username)
     if not collection_name:
@@ -215,8 +357,6 @@ def predict(username: str):
     return result
 
 
-from fastapi import BackgroundTasks
-
 TRAIN_STATUS = {
     "state": "idle",
     "last_run": None,
@@ -243,7 +383,10 @@ def _train_model_task():
 
 
 @app.post("/train-model")
-def train_model_endpoint(background_tasks: BackgroundTasks):
+def train_model_endpoint(
+    background_tasks: BackgroundTasks,
+    current_username: str = Depends(get_current_username),
+):
     if TRAIN_STATUS["state"] == "running":
         return {"message": "Training already in progress"}
     background_tasks.add_task(_train_model_task)
@@ -252,12 +395,14 @@ def train_model_endpoint(background_tasks: BackgroundTasks):
 
 
 @app.get("/train-status")
-def train_status():
+def train_status(current_username: str = Depends(get_current_username)):
     return TRAIN_STATUS
 
 
 @app.get("/cycle_data/{username}")
-def cycle_data(username: str):
+def cycle_data(username: str, current_username: str = Depends(get_current_username)):
+    if username != current_username:
+        raise HTTPException(status_code=403, detail="You can only access your own cycle dates")
     collection_name = get_user_collection(username)
     if not collection_name:
         raise HTTPException(status_code=404, detail="User not found")
