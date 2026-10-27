@@ -302,6 +302,11 @@ def login(credentials: LoginCredentials, background_tasks: BackgroundTasks):
     }
 
 
+@app.get("/auth/me")
+def get_authenticated_user(current_username: str = Depends(get_current_username)):
+    return {"username": current_username}
+
+
 @app.get("/predict/{username}")
 def predict(username: str, current_username: str = Depends(get_current_username)):
     if username != current_username:
