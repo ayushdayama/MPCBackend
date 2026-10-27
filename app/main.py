@@ -1,10 +1,10 @@
-from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Response
 from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from app.firebase_service import fetch_cycle_data
 from app.user_service import create_user, validate_login, get_user_collection
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import logging
 import os
 from datetime import datetime
@@ -17,6 +17,12 @@ except ImportError:
         "python-dotenv not installed; .env file will not be loaded automatically.")
 
 from app.security import APP_SECRET_KEY_CONFIGURED, create_calendar_state, create_session_token, decode_token, get_current_username
+from app.password_encryption import (
+    consume_password_encryption_challenge,
+    decrypt_credential_payload,
+    get_password_encryption_public_key,
+    issue_password_encryption_challenge,
+)
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
@@ -38,23 +44,40 @@ app.add_middleware(
 # Pydantic models for request validation
 
 
+class EncryptedCredentialPayload(BaseModel):
+    challenge: str = Field(min_length=32, max_length=128)
+    ephemeral_public_key: dict[str, object]
+    salt: str = Field(min_length=20, max_length=32)
+    iv: str = Field(min_length=16, max_length=24)
+    ciphertext: str = Field(min_length=22, max_length=24576)
+
+
 # Separate models for login and registration
 class LoginCredentials(BaseModel):
     username: str
-    password: str
+    encrypted: EncryptedCredentialPayload
 
 
 class RegisterCredentials(BaseModel):
     username: str
-    password: str
     securityQuestion: str
-    securityAnswer: str
+    encrypted: EncryptedCredentialPayload
 
 
 class SecurityAnswerRequest(BaseModel):
     username: str
-    securityAnswer: str
-    newPassword: str
+    encrypted: EncryptedCredentialPayload
+
+
+def _decrypt_submitted_credentials(encrypted: EncryptedCredentialPayload) -> dict:
+    try:
+        plaintext = decrypt_credential_payload(encrypted.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid encrypted credentials") from exc
+
+    if not consume_password_encryption_challenge(encrypted.challenge):
+        raise HTTPException(status_code=400, detail="Expired or used credential challenge")
+    return plaintext
 
 # AddCycleDateRequest model
 class AddCycleDateRequest(BaseModel):
@@ -125,8 +148,20 @@ def add_cycle_date(
         "calendar_sync": calendar_sync,
     }
 
+@app.get("/auth/encryption-challenge")
+def password_encryption_challenge(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return issue_password_encryption_challenge()
+
+
 @app.post("/register")
 def register(credentials: RegisterCredentials):
+    secret_fields = _decrypt_submitted_credentials(credentials.encrypted)
+    password = secret_fields.get("password")
+    security_answer = secret_fields.get("securityAnswer")
+    if not isinstance(password, str) or not isinstance(security_answer, str):
+        raise HTTPException(status_code=400, detail="Invalid encrypted credentials")
+
     logging.info(
         f"Received registration request for username: {credentials.username}")
     # Pass security question and answer to user_service
@@ -137,12 +172,12 @@ def register(credentials: RegisterCredentials):
     main_mod = sys.modules[__name__]
     setattr(main_mod, '_SECURITY_CONTEXT', {
         'security_question': credentials.securityQuestion,
-        'security_answer': credentials.securityAnswer,
+        'security_answer': security_answer,
     })
     try:
         result = create_user(
             credentials.username,
-            credentials.password,
+            password,
         )
     finally:
         setattr(main_mod, '_SECURITY_CONTEXT', None)
@@ -167,9 +202,15 @@ def get_security_question_endpoint(username: str):
 
 @app.post("/reset-password")
 def reset_password(req: SecurityAnswerRequest):
+    secret_fields = _decrypt_submitted_credentials(req.encrypted)
+    security_answer = secret_fields.get("securityAnswer")
+    new_password = secret_fields.get("newPassword")
+    if not isinstance(security_answer, str) or not isinstance(new_password, str):
+        raise HTTPException(status_code=400, detail="Invalid encrypted credentials")
+
     from app.user_service import verify_security_answer_and_reset
     result = verify_security_answer_and_reset(
-        req.username, req.securityAnswer, req.newPassword)
+        req.username, security_answer, new_password)
     if not result["success"]:
         raise HTTPException(status_code=400, detail=result["error"])
     return {"message": result["message"]}
@@ -288,9 +329,14 @@ def _warm_prediction_model():
 
 @app.post("/login")
 def login(credentials: LoginCredentials, background_tasks: BackgroundTasks):
+    secret_fields = _decrypt_submitted_credentials(credentials.encrypted)
+    password = secret_fields.get("password")
+    if not isinstance(password, str):
+        raise HTTPException(status_code=400, detail="Invalid encrypted credentials")
+
     logging.info(
         f"Received login request for username: {credentials.username}")
-    result = validate_login(credentials.username, credentials.password)
+    result = validate_login(credentials.username, password)
     if not result["success"]:
         raise HTTPException(status_code=401, detail=result["error"])
     username = result.get("username", credentials.username)
